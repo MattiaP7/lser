@@ -1,0 +1,49 @@
+# ==========================================
+# Build directories
+# ==========================================
+build/
+bin/
+out/
+.cache/
+
+# ==========================================
+# CMake generated files
+# ==========================================
+CMakeCache.txt
+CMakeFiles/
+DartConfiguration.tcl
+*.cmake
+install_manifest.txt
+CPackConfig.cmake
+CPackSourceConfig.cmake
+_CPack_Packages/
+
+# ==========================================
+# Binaries, executables and object files
+# ==========================================
+lser
+bench_lser
+lser_tests
+*.o
+*.obj
+*.exe
+
+# ==========================================
+# CPack distribution packages
+# ==========================================
+*.deb
+*.tar.gz
+*.rpm
+
+# ==========================================
+# IDEs and Editors
+# ==========================================
+.vscode/
+.idea/
+compile_commands.json
+
+# ==========================================
+# OS generated files
+# ==========================================
+.DS_Store
+Thumbs.db
