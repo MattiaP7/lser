@@ -74,7 +74,7 @@ ctest --test-dir build --output-on-failure
 
 # Installazione (opzionale)
 # Di default su Linux installa in /usr/local/bin. Puoi cambiare prefisso con --prefix <path>
-cmake --install build
+sudo cmake --install build
 ```
 
 Il build type di default è `Release` (`-O3` su GCC/Clang).
