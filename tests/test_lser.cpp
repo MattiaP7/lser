@@ -3,7 +3,7 @@
 #include "lser.hpp"
 
 #include <filesystem>
-#include <securitybaseapi.h>
+
 #include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
@@ -73,6 +73,7 @@ void run(std::string_view name, const std::function<void()> &test_body) {
 // ============================================================================
 
 #ifdef _WIN32
+  #include <securitybaseapi.h>
   #include <windows.h>
   #include <winnt.h>
 [[nodiscard]] inline bool is_windows_admin() noexcept {
