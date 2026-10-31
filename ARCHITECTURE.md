@@ -3,6 +3,20 @@
 Questo documento spiega **perché** LSer è fatto così. Dove un'affermazione è misurata viene indicato il numero e la
 fonte (vedi [BENCHMARKS.md](BENCHMARKS.md)); dove è un'ipotesi, è scritto esplicitamente.
 
+## Indice
+
+1. [Pipeline](#1-pipeline)
+2. [Modello dei dati](#2-modello-dei-dati)
+3. [Dalle mappe ai vettori piatti](#3-dalle-mappe-ai-vettori-piatti)
+4. [Backend di piattaforma](#4-backend-di-piattaforma)
+5. [Filtri: nascosti, profondità, `.gitignore`](#5-filtri-nascosti-profondità-gitignore)
+6. [CPU time vs memory churn](#6-cpu-time-vs-memory-churn)
+7. [Concorrenza](#7-concorrenza)
+8. [Sicurezza e correttezza](#8-sicurezza-e-correttezza)
+9. [Ordinamento](#9-ordinamento)
+10. [Output](#10-output)
+11. [Cosa non c'è (ancora)](#11-cosa-non-cè-ancora)
+
 ## 1. Pipeline
 
 ```mermaid
@@ -19,8 +33,8 @@ flowchart LR
     F --> G[stampa<br/>OutBuffer 64 KiB]
 ```
 
-1. **Scansione**: ogni task è "leggi *questa* cartella". Il worker fa `opendir`, `readdir`, e (solo se servono
-   dettagli) una `fstatat` per entry. Le sottocartelle trovate diventano nuovi task.
+1. **Scansione**: ogni task è "leggi *questa* cartella". Il worker elenca le entry applicando i filtri; le
+   sottocartelle trovate diventano nuovi task (se la profondità lo permette).
 2. **Ordinamento locale**: il worker ordina le entry della cartella appena letta, mentre i dati sono ancora in cache.
 3. **Raccolta**: ogni worker scrive in un proprio `std::vector<DirectoryResult>`: nessun lock sui risultati.
 4. **Merge** dopo il `join`, poi ordinamento dell'elenco cartelle in ordine di visita in profondità.
@@ -31,11 +45,12 @@ Il motore (`run_engine_only()`) copre i punti 1–4. La stampa è separata ed è
 ## 2. Modello dei dati
 
 ```cpp
-struct FileEntry {            // sizeof == 80
+struct FileEntry {            // sizeof == 80 su POSIX
   std::string name;           // solo il nome, non il path
   uintmax_t size; int64_t mtime_sec; uint32_t mtime_nsec, mode, uid, gid, nlink;
   int32_t link_idx;           // indice nel vettore dei target dei symlink
   FileType type; bool has_details;
+  // solo Windows: std::string win_user, win_group;  (+64 byte)
 };
 struct DirectoryResult {      // sizeof == 80
   std::string path;           // path della cartella: UNA volta sola
@@ -51,8 +66,11 @@ Scelte:
   Il path completo si ricostruisce solo se serve (`join_path`).
 - **Target dei symlink in un vettore a parte.** Sono rari: tenerli dentro `FileEntry` avrebbe aggiunto 32 byte
   a *ogni* entry. L'entry paga solo un `int32_t`.
-- **Tipo dal `d_type`.** Il kernel lo restituisce dentro `readdir` senza syscall aggiuntive. Si fa `fstatat` solo se
-  servono `size`/`mtime`/`mode` (`-l`, `-S`, `-t`) o se il filesystem restituisce `DT_UNKNOWN`.
+- **Tipo dal `d_type` (POSIX).** Il kernel lo restituisce dentro `readdir` senza syscall aggiuntive. Si fa `fstatat`
+  solo se servono `size`/`mtime`/`mode` (`-l`, `-S`, `-t`) o se il filesystem restituisce `DT_UNKNOWN`.
+- **Su Windows** `FileEntry` è più grande perché proprietario e gruppo sono SID risolti in stringa, non id numerici.
+  Il costo è accettato perché quei campi servono solo in `-l`; ottimizzarli (es. tabella condivisa + indice) è una
+  possibile evoluzione.
 
 ## 3. Dalle mappe ai vettori piatti
 
@@ -70,9 +88,50 @@ La gerarchia del tree view non è memorizzata: quando serve, `print_tree()` cost
 medio. Costo: O(numero di cartelle) per l'indice, O(n) complessivo per la stampa. L'indice è temporaneo e non fa parte
 dei dati del motore. Quindi: **lo storage è piatto, la mappa esiste solo come indice di lettura nel tree view**.
 
-## 4. CPU time vs memory churn
+## 4. Backend di piattaforma
 
-Misure su `/usr/include`, 30573 entry (`--track-memory`):
+Il codice è un unico header (`lser.hpp`) con un piccolo strato di astrazione; la selezione è a compile time
+(`#ifdef _WIN32`) e la logica comune (pool, ordinamento, stampa) è condivisa.
+
+| | POSIX | Windows |
+|---|---|---|
+| Enumerazione | `opendir` / `readdir` | `FindFirstFileW` / `FindNextFileW` |
+| Tipo | `d_type` (fallback `fstatat`) | `dwFileAttributes` |
+| Metadati | `fstatat(AT_SYMLINK_NOFOLLOW)` solo se servono | già presenti in `WIN32_FIND_DATAW` |
+| Proprietario / gruppo | `getpwuid` / `getgrgid` (cache in `IdNames`) | non disponibili: `Unknown` |
+| Permessi | `st_mode` reale | mapping fittizio |
+| Stringhe | UTF-8 nativo | conversione UTF-16 ⇄ UTF-8 a ogni entry |
+
+Conseguenza pratica: su Windows non c'è un "costo della `stat`" separato dalla scansione (vedi
+[BENCHMARKS.md](BENCHMARKS.md), punto 3), mentre la conversione UTF-16 → UTF-8 è un costo per entry che su Linux non
+esiste. Non è stato misurato quanto pesi.
+
+## 5. Filtri: nascosti, profondità, `.gitignore`
+
+I filtri sono applicati **durante la scansione**, non dopo: un'entry scartata non viene né salvata né ordinata, e una
+cartella scartata non genera task.
+
+- **Nascosti (`-a` assente):** si scartano i nomi che iniziano con `.`.
+- **Solo directory (`-D`):** i file e i symlink non entrano nel vettore.
+- **Profondità (`-L N`):** il task porta la sua `depth`; si scende solo se `depth + 1 < N`.
+- **`.gitignore` (`-g`):** ogni `Task` porta un `shared_ptr<GitIgnoreNode>`. Quando una cartella contiene un
+  `.gitignore`, si crea un nuovo nodo che punta al nodo del padre; i figli ereditano il nodo. La ricerca di una regola
+  risale la catena dei padri. `.git` è sempre escluso. I nodi sono immutabili dopo la creazione, quindi condivisibili
+  tra thread senza lock.
+
+Compromessi noti del matcher:
+
+- confronta **solo il nome** (basename), non il percorso relativo: `build/` funziona, `docs/build/` no;
+- supporta pattern esatti, `*suffisso`, `prefisso*` e `/` finale (solo directory);
+- non supporta negazioni (`!`), `**`, ancoraggio con `/` iniziale, jolly in mezzo al nome o classi `[...]`;
+- ogni cartella paga un controllo di esistenza del `.gitignore` (una chiamata in più per cartella).
+
+È una semplificazione voluta: copre i casi d'uso tipici (`node_modules`, `build`, `*.o`) senza portarsi dietro un
+parser completo. Un'implementazione fedele a git richiederebbe una libreria di glob dedicata.
+
+## 6. CPU time vs memory churn
+
+Misure su `/usr/include`, 30 573 entry (`--track-memory`):
 
 | Metrica | Valore | Per entry |
 |---|---|---|
@@ -90,9 +149,10 @@ Le decisioni che spostano questi numeri:
 - **Un'allocazione per cartella** per la stringa del path (serve ai figli come prefisso).
 
 Il "peak" riportato è il picco dell'heap C++ (somma dei `malloc_usable_size` vivi), **non** la RSS del processo, che
-include anche eseguibile, librerie, stack dei thread e arene di glibc (una per thread).
+include anche eseguibile, librerie, stack dei thread e arene di glibc (una per thread). Il tracciamento è fatto
+sostituendo `operator new/delete` nel solo `bench.cpp`.
 
-## 5. Concorrenza
+## 7. Concorrenza
 
 Il meccanismo è una **pila condivisa** (`std::vector<Task>` usato in LIFO) protetta da un mutex, con una
 `condition_variable` e un contatore `pending` = cartelle in coda *più* cartelle in lavorazione.
@@ -100,7 +160,8 @@ Il meccanismo è una **pila condivisa** (`std::vector<Task>` usato in LIFO) prot
 ```
 worker:  lock → attendi (pila non vuota || pending == 0) → se pila vuota: esci → pop → unlock
          scan(cartella) → lock → push sottocartelle; pending += figli; pending -= 1 → unlock
-         se pending == 0: notify_all
+         se pending == 0 o figli > 1: notify_all
+         se figli == 1:               notify_one
 ```
 
 Perché termina correttamente: `pending` viene incrementato per i figli **prima** di essere decrementato per il padre,
@@ -108,36 +169,48 @@ nello stesso blocco sotto lock; quindi non può valere 0 finché esiste lavoro. 
 worker in attesa si svegliano ed escono. Il test di correttezza ripete la scansione 100 volte con 1, 2, 4 e 8 thread
 (anche sotto ThreadSanitizer) per cercare race e deadlock.
 
+Dettagli di robustezza:
+
+- il thread chiamante è il worker 0: con `-j 1` non viene creato nessun thread;
+- se la creazione di un thread fallisce (`std::system_error`) si prosegue con quelli già creati;
+- un'eccezione dentro un worker viene catturata e riportata come errore invece di chiamare `std::terminate`;
+- la scelta di `notify_one` / `notify_all` evita di svegliare l'intera pool quando c'è un solo nuovo task.
+
 > **Nota di onestà.** È una coda di *work-sharing* (una struttura condivisa), **non** una work-stealing queue (code
 > per-thread da cui i thread rubano). Il lock è tenuto solo per `push`/`pop`: il lavoro costoso (syscall) è fuori dal
 > lock.
 
-### Carico I/O del kernel
+### Scaling osservato
 
-`readdir` e `fstatat` sono syscall bloccanti. Con la page cache calda sono veloci ma non gratis: attraversano la VFS
-(lookup dei dentry, lock degli inode). Più thread permettono di sovrapporre queste attese e di usare più core.
-Nei benchmark lo scaling è reale ma sub-lineare:
+Lo scaling è reale ma sub-lineare, con un massimo intorno ai core fisici:
 
 | Thread | 1 | 2 | 4 | 8 |
 |---|---|---|---|---|
-| `Recursive_Simple` (speedup) | 1,00× | 1,68× | 2,66× | 4,04× |
-| `Recursive_LongFormat` (speedup) | 1,00× | 1,80× | 2,85× | 3,81× |
+| Linux, `Recursive_Simple` (speedup) | 1,00× | 1,68× | 2,66× | 4,04× |
+| Linux, `Recursive_LongFormat` (speedup) | 1,00× | 1,80× | 2,85× | 3,81× |
+| Windows, `Recursive_Simple` (speedup) | 1,00× | 1,90× | 2,72× | 4,18× |
+| Windows, `Recursive_LongFormat` (speedup) | 1,00× | 1,61× | 2,49× | 4,11× |
 
-Cause **probabili** (non profilate): lavoro per task piccolo (poche decine di entry per cartella), lock interni della
-VFS condivisi tra thread, la parte seriale finale (merge + ordinamento cartelle), e overhead di sincronizzazione.
-Il profiling con `perf` è il passo successivo per distinguere i contributi.
+Su Windows con 12 thread logici, 12 thread sono **più lenti** di 8 (+7–13 %): oltre i core fisici si aggiunge solo
+contesa.
 
-## 6. Sicurezza e correttezza
+Cause **probabili** (non profilate): lavoro per task piccolo (poche decine di entry per cartella), lock interni del
+kernel/VFS (o dell'NTFS driver) condivisi tra thread, la parte seriale finale (merge + ordinamento cartelle), e
+overhead di sincronizzazione sul mutex. Il profiling (`perf` su Linux, ETW/VTune su Windows) è il passo successivo per
+distinguere i contributi.
+
+## 8. Sicurezza e correttezza
 
 - **Niente symlink seguiti.** Si usa `AT_SYMLINK_NOFOLLOW`/`d_type`: un link a una cartella è un'entry di tipo
   `Symlink`, non un task. Un link a un antenato non può quindi creare loop. (La radice indicata dall'utente viene
   invece risolta, come fa `ls`.)
-- **Errori non fatali.** `opendir`/`fstatat`/`readdir` falliti finiscono in un `ErrorSink` (con mutex) e vengono
-  stampati ordinati su stderr; il resto della scansione prosegue. Un'eccezione dentro un worker viene catturata e
-  riportata come errore invece di chiamare `std::terminate`.
+- **Errori non fatali.** Fallimenti di apertura/lettura finiscono in un `ErrorSink` (con mutex) e vengono stampati
+  ordinati su stderr; il resto della scansione prosegue.
+- **Validazione degli argomenti.** `-L` e `-j` accettano solo interi in `[1, 4096]`; opzioni sconosciute o valori
+  mancanti terminano con exit code 2.
 - **Verifica esterna.** Il benchmark confronta il conteggio con `std::filesystem::recursive_directory_iterator`.
 
-## 7. Ordinamento
+## 9. Ordinamento
 
 - Il comparatore ha una direzione naturale (nome crescente, dimensione e data decrescenti) e `-R` la inverte per
   intero, spareggi inclusi: resta un ordine totale e deterministico.
@@ -146,15 +219,19 @@ Il profiling con `perf` è il passo successivo per distinguere i contributi.
 - `std::execution::par` (TBB) viene usato **solo** per l'ordinamento dell'elenco cartelle, e solo sopra le 20 000
   cartelle, dove ripaga l'overhead. L'ordinamento delle entry avviene già in parallelo perché distribuito tra i worker.
 
-## 8. Output
+## 10. Output
 
 `OutBuffer` accumula con `std::format_to` e scrive con `fwrite` ogni 64 KiB, invece di una chiamata di stampa per riga.
 Nel formato lungo le larghezze delle colonne sono calcolate per cartella, come `ls`; utenti e gruppi sono risolti una
-sola volta e messi in cache.
+sola volta e messi in cache. I colori sono ANSI e si attivano con `--color=auto` solo se stdout è un TTY e `NO_COLOR`
+non è definita.
 
-## 9. Cosa non c'è (ancora)
+## 11. Cosa non c'è (ancora)
 
 - Vere code per-thread con work stealing; batch di task per ridurre il lock.
 - `getdents64` diretto con buffer grandi (oggi `readdir` di glibc) e `statx`/`io_uring` per batch di `stat`.
-- Collation di locale; ACL/xattr; deduplicazione degli hard link.
-- Profiling `perf` documentato (cache miss, contesa sul mutex).
+- Su Windows: `NtQueryDirectoryFile` con buffer grandi, owner/gruppo e ACL reali, gestione esplicita di junction e
+  reparse point.
+- `.gitignore` completo (negazioni, `**`, pattern con percorso).
+- Collation di locale; ACL/xattr su Linux; deduplicazione degli hard link.
+- Profiling documentato (cache miss, contesa sul mutex).

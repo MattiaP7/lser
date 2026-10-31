@@ -1,0 +1,37 @@
+
+======================================================
+ LSer Benchmark
+ Target Directory : C:\Users\7matt\Desktop\c++\
+ Tracciamento mem : spento
+ Verifica         : OK (9919 entry, uguale a std::filesystem)
+======================================================
+
+------------------------------------------------------------------------------------------------------------
+Benchmark                                                  Time             CPU   Iterations UserCounters...
+------------------------------------------------------------------------------------------------------------
+BM_LSer_Recursive_Simple/threads:1/real_time            32.6 ms         32.0 ms           20 Entries=5.425k items_per_second=166.319k/s
+BM_LSer_Recursive_Simple/threads:2/real_time            17.2 ms         16.9 ms           38 Entries=5.425k items_per_second=315.185k/s
+BM_LSer_Recursive_Simple/threads:4/real_time            12.0 ms         11.3 ms           61 Entries=5.425k items_per_second=451.612k/s
+BM_LSer_Recursive_Simple/threads:8/real_time            7.79 ms         6.29 ms           87 Entries=5.425k items_per_second=696.486k/s
+BM_LSer_Recursive_Simple/threads:12/real_time           8.32 ms         5.21 ms           87 Entries=5.425k items_per_second=651.811k/s
+BM_LSer_Recursive_Simple/threads:0/real_time            8.56 ms         5.07 ms           77 Entries=5.425k items_per_second=633.705k/s
+BM_LSer_Recursive_LongFormat/threads:1/real_time        48.1 ms         48.0 ms           14 Entries=9.919k items_per_second=206.105k/s
+BM_LSer_Recursive_LongFormat/threads:2/real_time        29.9 ms         29.2 ms           23 Entries=9.919k items_per_second=331.315k/s
+BM_LSer_Recursive_LongFormat/threads:4/real_time        19.3 ms         17.4 ms           36 Entries=9.919k items_per_second=514.523k/s
+BM_LSer_Recursive_LongFormat/threads:8/real_time        11.7 ms         9.64 ms           60 Entries=9.919k items_per_second=844.905k/s
+BM_LSer_Recursive_LongFormat/threads:12/real_time       13.2 ms         8.39 ms           54 Entries=9.919k items_per_second=751.431k/s
+BM_LSer_Recursive_LongFormat/threads:0/real_time        13.1 ms         7.37 ms           53 Entries=9.919k items_per_second=758.581k/s
+BM_LSer_Recursive_SortSize/threads:1/real_time          46.6 ms         46.9 ms           15 Entries=9.919k items_per_second=212.667k/s
+BM_LSer_Recursive_SortSize/threads:2/real_time          29.9 ms         29.9 ms           24 Entries=9.919k items_per_second=331.483k/s
+BM_LSer_Recursive_SortSize/threads:4/real_time          19.3 ms         19.0 ms           37 Entries=9.919k items_per_second=514.432k/s
+BM_LSer_Recursive_SortSize/threads:8/real_time          11.5 ms         10.2 ms           61 Entries=9.919k items_per_second=866.288k/s
+BM_LSer_Recursive_SortSize/threads:12/real_time         13.4 ms         10.0 ms           56 Entries=9.919k items_per_second=740.472k/s
+BM_LSer_Recursive_SortSize/threads:0/real_time          13.0 ms         8.25 ms           53 Entries=9.919k items_per_second=762.724k/s
+BM_LSer_TreeView/threads:1/real_time                    47.9 ms         47.9 ms           15 Entries=9.919k items_per_second=207.271k/s
+BM_LSer_TreeView/threads:2/real_time                    30.3 ms         30.6 ms           23 Entries=9.919k items_per_second=327.797k/s
+BM_LSer_TreeView/threads:4/real_time                    19.1 ms         17.4 ms           36 Entries=9.919k items_per_second=520.681k/s
+BM_LSer_TreeView/threads:8/real_time                    11.3 ms         10.2 ms           60 Entries=9.919k items_per_second=879.885k/s
+BM_LSer_TreeView/threads:12/real_time                   13.2 ms         7.21 ms           52 Entries=9.919k items_per_second=751.072k/s
+BM_LSer_TreeView/threads:0/real_time                    13.0 ms         7.81 ms           54 Entries=9.919k items_per_second=764.78k/s
+
+

@@ -1,16 +1,21 @@
 #include "lser.hpp"
 
-#include <unistd.h>
+// #include <benchmark/benchmark.h>
 
-#include <algorithm>
-#include <charconv>
+#ifdef _WIN32
+  #include <malloc.h>
+  #define malloc_usable_size                                                   \
+    _msize // Fix per MSVC compilazione Memory Space alloc
+#else
+  #include <malloc.h>
+#endif
+
+#include <atomic>
 #include <cstdlib>
-#include <exception>
+#include <cstring>
+#include <new>
 #include <print>
 #include <string>
-#include <string_view>
-#include <system_error>
-#include <vector>
 
 namespace {
 
@@ -186,8 +191,13 @@ int main(int argc, char **argv) {
     flags.color = false;
     break;
   case ColorMode::Auto:
+#ifdef _WIN32
+    flags.color =
+        _isatty(_fileno(stdout)) != 0 && std::getenv("NO_COLOR") == nullptr;
+#else
     flags.color =
         ::isatty(STDOUT_FILENO) != 0 && std::getenv("NO_COLOR") == nullptr;
+#endif
     break;
   }
   flags.force_headers = paths.size() > 1;

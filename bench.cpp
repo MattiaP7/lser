@@ -12,6 +12,13 @@
 
 static std::string g_target = "/usr/include";
 
+inline std::size_t get_alloc_size(void *p) noexcept {
+#ifdef _WIN32
+  return _msize(p);
+#else
+  return malloc_usable_size(p);
+#endif
+}
 namespace {
 std::atomic<bool> g_track{false};
 std::atomic<std::int64_t> g_current{0};
@@ -36,7 +43,7 @@ void *operator new(std::size_t size) {
   if (p == nullptr)
     throw std::bad_alloc();
   if (g_track.load(std::memory_order_relaxed))
-    account_alloc(static_cast<std::int64_t>(::malloc_usable_size(p)));
+    account_alloc(static_cast<std::int64_t>(get_alloc_size(p)));
   return p;
 }
 
@@ -44,7 +51,7 @@ void operator delete(void *p) noexcept {
   if (p == nullptr)
     return;
   if (g_track.load(std::memory_order_relaxed))
-    g_current.fetch_sub(static_cast<std::int64_t>(::malloc_usable_size(p)),
+    g_current.fetch_sub(static_cast<std::int64_t>(get_alloc_size(p)),
                         std::memory_order_relaxed);
   std::free(p);
 }
@@ -123,14 +130,26 @@ static void BM_LSer_TreeView(benchmark::State &state) {
   RunEngine(state, flags);
 }
 
+static void ThreadArguments(benchmark::internal::Benchmark *b) {
+  // aggiungiamo potenze di 2: 1, 2, 4, ... fino a superare i core massimi
+  unsigned int max_cores = std::thread::hardware_concurrency();
+  for (unsigned int threads = 1; threads <= max_cores; threads *= 2) {
+    b->Args({threads});
+  }
+
+  // se non e' potenza di 2 aggiungiamo il max
+  if (max_cores > 0 && (max_cores & (max_cores - 1)) != 0) {
+    b->Args({max_cores});
+  }
+
+  // comportamento default
+  b->Args({0});
+}
+
 #define LSER_BENCH(fn)                                                         \
   BENCHMARK(fn)                                                                \
       ->ArgName("threads")                                                     \
-      ->Arg(1)                                                                 \
-      ->Arg(2)                                                                 \
-      ->Arg(4)                                                                 \
-      ->Arg(8)                                                                 \
-      ->Arg(0)                                                                 \
+      ->Apply(ThreadArguments)                                                 \
       ->Unit(benchmark::kMillisecond)                                          \
       ->UseRealTime()
 

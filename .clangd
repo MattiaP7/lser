@@ -1,0 +1,20 @@
+CompileFlags:
+  Add: [
+    -std=c++23,
+    -Wall,
+    -Wextra,
+    -Wunused,
+    -Wpedantic,
+    -Wshadow,
+    -Werror,
+    -Wconversion,
+    # -Wold-style-cast,
+    -Wshadow,
+    -march=native,
+    -pthread
+  ]
+  Compiler: D:/msys64/ucrt64/bin/g++.exe
+Diagnostics:
+  Suppress:
+    - pp_file_not_found
+    - missing-system-header-arg

@@ -1,21 +1,15 @@
-#pragma once
-
 /**
  * @file lser.hpp
- * @brief LSer - Clone C++23 multithreaded di ls / tree ad alte prestazioni
- * (Linux/POSIX).
+ * @brief LSer - Clone C++23 multithreaded di ls / tree ad alte prestazioni.
  *
  * Implementa un motore Data-Oriented per l'esplorazione e l'ordinamento di
  * directory. Progettato per massimizzare la cache locality tramite flat vectors
  * e zero-copy.
+ *
+ * @author Mattia Pirazzi
  */
 
-#include <dirent.h>
-#include <fcntl.h>
-#include <grp.h>
-#include <pwd.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#pragma once
 
 #include <algorithm>
 #include <cctype>
@@ -45,7 +39,40 @@
 #include <vector>
 
 #ifdef LSER_HAS_TBB
-#include <execution>
+  #include <execution>
+#endif
+
+// ----------------------------------------------------------------------------
+// Astrazione di Sistema (OS Abstraction Layer)
+// ----------------------------------------------------------------------------
+#ifdef _WIN32
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <windows.h>
+
+  // MinGW ha già mode_t, MSVC no
+  #ifndef __MINGW32__
+using mode_t = unsigned int;
+  #endif
+
+  #ifndef S_ISDIR
+    #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+  #endif
+  #ifndef S_ISREG
+    #define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+  #endif
+#else
+  // Sistemi POSIX (Linux, macOS, ecc.)
+  #include <dirent.h>
+  #include <fcntl.h>
+  #include <grp.h>
+  #include <pwd.h>
+  #include <sys/stat.h>
+  #include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -58,38 +85,45 @@ namespace lser {
 enum class SortBy { Name, Size, Time };
 
 /**
- * @brief Configurazione dei flag per il motore di esplorazione.
+ * @struct ListFlags
+ * @brief Struttura di configurazione dei parametri operativi.
+ *
+ * Contiene tutti i flag booleani e numerici passati da linea di comando che
+ * alterano il comportamento della formattazione e della scansione del motore
+ * LSer.
  */
 struct ListFlags {
-  bool show_hidden{false};    ///< Mostra file nascosti (iniziano con '.')
-  bool long_format{false};    ///< Raccoglie e stampa dettagli (permessi, size)
-  bool human_readable{false}; ///< Size in KB, MB, GB
-  bool recursive{false};      ///< Esplora sottocartelle
-  bool tree_view{false};      ///< Costruisce output gerarchico ad albero
-  bool reverse_sort{false};   ///< Inverte il criterio di ordinamento
-  bool dirs_only{false};      ///< Raccoglie solo le directory
-  bool ignore_case{false};    ///< Ordinamento case-insensitive
-  bool color{false};          ///< Abilita i colori ANSI
-  bool summary{false};        ///< Stampa contatore finale
-  bool time_exec{false};      ///< Misura i tempi del motore
-  bool force_headers{false};  ///< Forza intestazione cartella
-  bool git_ignore{false};     ///< Parsa i file .gitignore e nasconde i match
-  SortBy sort_by{SortBy::Name};
-  int max_depth{-1};   ///< Profondita' massima (-1 illimitata)
-  unsigned threads{0}; ///< Numero di thread (0 = max hardware)
+  bool show_hidden{false}; ///< Se true, include i file che iniziano con '.'.
+  bool long_format{false}; ///< Formatta output simile a `ls -l` recuperando
+                           ///< dettagli di permessi, owner e time.
+  bool human_readable{
+      false}; ///< Converte i bytes (size) in potenze del 1024 (KB, MB, GB).
+  bool recursive{false}; ///< Attiva la scansione in profondita per tutte le
+                         ///< sotto cartelle.
+  bool tree_view{false}; ///< Output formattato ad albero (implica recursive).
+  bool reverse_sort{false}; ///< Inverte il criterio di ordinamento prescelto.
+  bool dirs_only{false};    ///< Ignora tutti i file regolari/symlink,
+                            ///< collezionando solo le directory.
+  bool ignore_case{false};  ///< Ignora la distinzione maiuscole/minuscole
+                            ///< durante il sorting alfabetico.
+  bool color{false}; ///< Utilizza i codici ANSI escape per colorare i path
+                     ///< nell'output.
+  bool summary{
+      false}; ///< Mostra un report finale sul totale degli elementi trovati.
+  bool time_exec{false}; ///< Esegue il timing del motore e lo stampa su stderr.
+  bool force_headers{false}; ///< Forza la stampa del blocco "path:" ad inizio
+                             ///< dir anche non in recursive.
+  bool git_ignore{false}; ///< Applica le regole dei file `.gitignore` trovati
+                          ///< durante lo scan.
+  SortBy sort_by{SortBy::Name}; ///< Criterio principale per l'ordinamento.
+  int max_depth{-1};   ///< Limita la profondita di scansione. -1 significa
+                       ///< nessuna limitazione.
+  unsigned threads{0}; ///< Imposta il numero di worker threads. 0 = numero
+                       ///< logico di core del sistema.
 };
-
-template <typename T>
-concept Flaggable = requires(T t) {
-  { t.show_hidden } -> std::convertible_to<bool>;
-  { t.long_format } -> std::convertible_to<bool>;
-  { t.human_readable } -> std::convertible_to<bool>;
-  { t.recursive } -> std::convertible_to<bool>;
-};
-static_assert(Flaggable<ListFlags>);
 
 /**
- * @brief Tipi di file POSIX supportati.
+ * @brief Elenco tipizzato dei file per un parsing semplificato.
  */
 enum class FileType : std::uint8_t {
   Unknown,
@@ -100,40 +134,88 @@ enum class FileType : std::uint8_t {
 };
 
 /**
- * @brief Entry singola ottimizzata (Memory-aligned).
+ * @struct FileEntry
+ * @brief Struttura dati piatta, memoria allineata per l'uso cache-friendly del
+ * Data-Oriented Design.
+ *
+ * Contiene tutti i metadati estratti per la stampa di un singolo elemento del
+ * File System. I path radice non vengono inseriti qui ma nel container genitore
+ * (DirectoryResult) per evitare allocazioni stringa superflue e RAM footprint
+ * elevato.
  */
 struct FileEntry {
-  std::string name{};
-  std::uintmax_t size{0};
-  std::int64_t mtime_sec{0};
-  std::uint32_t mtime_nsec{0};
-  std::uint32_t mode{0};
-  std::uint32_t uid{0};
-  std::uint32_t gid{0};
-  std::uint32_t nlink{0};
-  std::int32_t link_idx{-1};
-  FileType type{FileType::Unknown};
-  bool has_details{false};
+  std::string name{};     ///< Nome base del file, senza percorso.
+  std::uintmax_t size{0}; ///< Dimensione in bytes (valida per Regular files).
+  std::int64_t mtime_sec{
+      0}; ///< Data di ultima modifica in timestamp Unix (secondi).
+  std::uint32_t mtime_nsec{0}; ///< Parte nanosecondi del timestamp.
+  std::uint32_t mode{0};       ///< Maschera di bit dei permessi POSIX (su Win32
+                               ///< contiene mapping fittizio).
+  std::uint32_t uid{0};        ///< ID dell'utente proprietario. (Su win un hash
+                               ///< univoco o string length).
+  std::uint32_t gid{0};        ///< ID del gruppo proprietario.
+  std::uint32_t nlink{0};      ///< Contatore per hard-link.
+  std::int32_t link_idx{
+      -1}; ///< Indice stringa del percorso risolto (se Symlink), referenziato
+           ///< nel vettore Links padre.
+  FileType type{
+      FileType::Unknown};  ///< Enum che classifica il tipo di file trovato.
+  bool has_details{false}; ///< Segnala se i dati (size, date, user) sono stati
+                           ///< popolati tramite stat/winAPI.
 
+#ifdef _WIN32
+  // Estensione per Windows in quanto User/Group sono SID strings lunghe, non ID
+  // numerici.
+  std::string win_user{};
+  std::string win_group{};
+#endif
+
+  /**
+   * @brief Helper per verificare velocemente se l'entry punta a una cartella.
+   * @return true se il tipo corrisponde a FileType::Directory.
+   */
   [[nodiscard]] bool is_directory() const noexcept {
     return type == FileType::Directory;
   }
+
+  /**
+   * @brief Helper per verificare velocemente se l'entry punta a un collegamento
+   * simbolico.
+   * @return true se il tipo corrisponde a FileType::Symlink.
+   */
   [[nodiscard]] bool is_symlink() const noexcept {
     return type == FileType::Symlink;
   }
+
+  /**
+   * @brief Helper POSIX per stabilire se si tratta di un file nascosto.
+   * @return true se il nome file comincia con un carattere 'punto' (.).
+   */
   [[nodiscard]] bool is_hidden() const noexcept {
     return !name.empty() && name[0] == '.';
   }
 };
 
 /**
- * @brief Risultato piatto di una directory esplorata.
+ * @struct DirectoryResult
+ * @brief Raccoglitore per i risultati della scansione di un intero livello di
+ * cartella.
+ *
+ * Utilizzato dai worker per accumulare batch di file thread-locally per poi
+ * pusharli ai risultati.
  */
 struct DirectoryResult {
-  std::string path{};
-  std::vector<FileEntry> entries{};
-  std::vector<std::string> links{};
+  std::string path{}; ///< Path del ramo elaborato.
+  std::vector<FileEntry>
+      entries{}; ///< Array piatto continuo (DOD) per la L1/L2 cache.
+  std::vector<std::string>
+      links{}; ///< Targets effettivi prelevati durante readlink (se Symlinks)
 
+  /**
+   * @brief Ritorna il puntatore stringa se quest'entry contiene un symlink,
+   * altrimenti nullptr.
+   * @param e La entry da interrogare.
+   */
   [[nodiscard]] const std::string *
   link_target(const FileEntry &e) const noexcept {
     return e.link_idx >= 0 ? &links[static_cast<std::size_t>(e.link_idx)]
@@ -141,13 +223,21 @@ struct DirectoryResult {
   }
 };
 
+/**
+ * @namespace detail
+ * @brief Implementazioni interne per l'astrazione OS, formattazioni stringa e
+ * buffers (non API utente).
+ */
 namespace detail {
-
 inline constexpr std::string_view kReset = "\033[0m";
 inline constexpr std::string_view kBlue = "\033[1;34m";
 inline constexpr std::string_view kCyan = "\033[1;36m";
 inline constexpr std::string_view kGreen = "\033[1;32m";
 
+#ifndef _WIN32
+/**
+ * @brief Mappa d_type della struct dirent al nostro FileType Enum. (OS POSIX)
+ */
 [[nodiscard]] inline FileType type_from_dtype(unsigned char d) noexcept {
   switch (d) {
   case DT_REG:
@@ -163,6 +253,9 @@ inline constexpr std::string_view kGreen = "\033[1;32m";
   }
 }
 
+/**
+ * @brief Esegue mapping di default con struct stat. (OS POSIX)
+ */
 [[nodiscard]] inline FileType type_from_mode(mode_t m) noexcept {
   if (S_ISREG(m))
     return FileType::Regular;
@@ -173,6 +266,9 @@ inline constexpr std::string_view kGreen = "\033[1;32m";
   return FileType::Other;
 }
 
+/**
+ * @brief Copia i metadata POSIX di `fstatat` nella entry di sistema. (OS POSIX)
+ */
 inline void fill_from_stat(FileEntry &e, const struct stat &st) noexcept {
   e.size = static_cast<std::uintmax_t>(st.st_size);
   e.mtime_sec = static_cast<std::int64_t>(st.st_mtim.tv_sec);
@@ -184,24 +280,105 @@ inline void fill_from_stat(FileEntry &e, const struct stat &st) noexcept {
   e.type = type_from_mode(st.st_mode);
   e.has_details = true;
 }
+#else
+/**
+ * @brief Copia i metadata Windows di `WIN32_FIND_DATAW` nella entry di sistema.
+ * (OS Win32)
+ */
+inline void fill_from_find_data(FileEntry &e,
+                                const WIN32_FIND_DATAW &data) noexcept {
+  ULARGE_INTEGER sz, time;
+  sz.LowPart = data.nFileSizeLow;
+  sz.HighPart = data.nFileSizeHigh;
+  e.size = static_cast<std::uintmax_t>(sz.QuadPart);
 
+  // Windows usa epoch dal 1601 in intervalli da 100ns
+  time.LowPart = data.ftLastWriteTime.dwLowDateTime;
+  time.HighPart = data.ftLastWriteTime.dwHighDateTime;
+
+  // Conversione approssimata da filetime Win32 a timestamp UNIX
+  e.mtime_sec = (time.QuadPart / 10000000ULL) - 11644473600ULL;
+  e.mtime_nsec = 0; // tralasciamo la parte micro
+
+  if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+    e.type = FileType::Directory;
+  } else if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+    e.type = FileType::Symlink;
+  } else {
+    e.type = FileType::Regular;
+  }
+
+  e.has_details = true;
+}
+
+/**
+ * @brief Helper per convertire il formato String Wide in String u8/ASCII (OS
+ * Win32)
+ */
+inline std::string utf16_to_utf8(const std::wstring &wstr) {
+  if (wstr.empty())
+    return std::string();
+  int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(),
+                                        NULL, 0, NULL, NULL);
+  std::string strTo(static_cast<size_t>(size_needed), 0);
+  WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0],
+                      size_needed, NULL, NULL);
+  return strTo;
+}
+
+inline std::wstring utf8_to_utf16(const std::string &str) {
+  if (str.empty())
+    return std::wstring();
+  int size_needed =
+      MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+  std::wstring wstrTo(static_cast<size_t>(size_needed), 0);
+  MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0],
+                      size_needed);
+  return wstrTo;
+}
+#endif
+
+/**
+ * @brief Helper portabile che concatena due branch del percorso verificando gli
+ * Slash path corretti.
+ */
 [[nodiscard]] inline std::string join_path(std::string_view base,
                                            std::string_view name) {
   std::string r;
   r.reserve(base.size() + 1 + name.size());
   r.append(base);
+#ifdef _WIN32
+  if (!r.empty() && r.back() != '\\' && r.back() != '/')
+    r.push_back('/'); // normalizziamo a forward slash
+#else
   if (!r.empty() && r.back() != '/')
     r.push_back('/');
+#endif
   r.append(name);
   return r;
 }
 
+/**
+ * @brief Pulisce l'estremita terminale del root target (elimina gli slash
+ * eccedenti a coda).
+ */
 [[nodiscard]] inline std::string normalize_root(std::string p) {
+#ifdef _WIN32
+  while (p.size() > 1 && (p.back() == '/' || p.back() == '\\'))
+#else
   while (p.size() > 1 && p.back() == '/')
+#endif
     p.pop_back();
   return p;
 }
 
+/**
+ * @brief Comparatore interno per ordinare DirectoryPaths.
+ *
+ * L'ordine è una visita in profondità DFS, per simulare la stampata sequenziale
+ * logica. Un padre viene sempre stampato prima del discendente (a prescindere
+ * da `reverse`).
+ */
 [[nodiscard]] inline bool path_less(const std::string &a, const std::string &b,
                                     bool reverse) noexcept {
   const std::size_t n = std::min(a.size(), b.size());
@@ -228,6 +405,9 @@ inline void fill_from_stat(FileEntry &e, const struct stat &st) noexcept {
   return reverse ? ca > cb : ca < cb;
 }
 
+/**
+ * @brief Confronta i nomi per il sorting alfabetico.
+ */
 [[nodiscard]] inline int
 compare_names(const std::string &a, const std::string &b, bool icase) noexcept {
   if (!icase)
@@ -244,6 +424,11 @@ compare_names(const std::string &a, const std::string &b, bool icase) noexcept {
   return a.compare(b);
 }
 
+/**
+ * @struct EntryLess
+ * @brief Functor di smistamento per std::sort iniettato sui batch. Supporta
+ * Name, Size, Time + Reverse.
+ */
 struct EntryLess {
   SortBy by;
   bool reverse;
@@ -268,6 +453,9 @@ struct EntryLess {
   }
 };
 
+/**
+ * @brief Formatta i byte in K, M, G, T.
+ */
 [[nodiscard]] inline std::string format_size(std::uintmax_t bytes) {
   constexpr std::string_view units[] = {"B", "K", "M", "G", "T", "P"};
   if (bytes < 1024)
@@ -281,7 +469,17 @@ struct EntryLess {
   return std::format("{:.1f}{}", size, units[unit_idx]);
 }
 
+/**
+ * @brief Costruisce la stringa dei permessi (es. "drwxr-xr-x").
+ */
 [[nodiscard]] inline std::string format_mode(std::uint32_t m) {
+#ifdef _WIN32
+  // Implementazione stub o approssimazione di base su Windows.
+  // Poichè non usa i chmod POSIX, non riporteremo stringhe perfette.
+  std::string r(10, '-');
+  if (m == 0)
+    return r; // File Entry generata tramite FindNext, usiamo defaults Win.
+#else
   std::string r(10, '-');
   if (S_ISDIR(m))
     r[0] = 'd';
@@ -311,14 +509,24 @@ struct EntryLess {
   if (m & S_ISVTX)
     r[9] = (m & S_IXOTH) ? 't' : 'T';
   return r;
+#endif
+  return std::string(10, '-');
 }
 
+/**
+ * @brief Formatta un unix epoch TimeStamp in human string come nel tool `ls`.
+ */
 [[nodiscard]] inline std::string format_time(std::int64_t sec,
                                              std::int64_t now) {
   const std::time_t t = static_cast<std::time_t>(sec);
   std::tm tm{};
+#ifdef _WIN32
+  if (localtime_s(&tm, &t) != 0)
+    return "?";
+#else
   if (localtime_r(&t, &tm) == nullptr)
     return "?";
+#endif
   constexpr std::int64_t half_year = 182LL * 24 * 3600;
   const bool recent = sec >= now - half_year && sec <= now + 3600;
   char buf[48];
@@ -327,6 +535,11 @@ struct EntryLess {
   return std::string(buf, n);
 }
 
+/**
+ * @class OutBuffer
+ * @brief I/O Stream personalizzato, limita l'overhead di IO flush. (64 KiB
+ * Blocks)
+ */
 class OutBuffer {
 public:
   explicit OutBuffer(std::FILE *f) : f_(f) { buf_.reserve(kFlushAt + 4096); }
@@ -362,6 +575,11 @@ private:
   std::string buf_{};
 };
 
+/**
+ * @struct ErrorSink
+ * @brief Interfaccia thread-safe per accumulare diagnostici non bloccanti del
+ * motore senza bloccare i thread.
+ */
 struct ErrorSink {
   std::mutex m{};
   std::vector<std::string> messages{};
@@ -371,9 +589,18 @@ struct ErrorSink {
   }
 };
 
+/**
+ * @class IdNames
+ * @brief Cache Resolver Single-thread. Trasforma ID numerici (o hash SID Win32)
+ * in alias stringa utente/gruppo.
+ */
 class IdNames {
 public:
-  const std::string &user(std::uint32_t id) {
+  const std::string &user(std::uint32_t id, const std::string &winName = "") {
+    (void)id;
+#ifdef _WIN32
+    return winName.empty() ? fallback_ : winName;
+#else
     auto it = users_.find(id);
     if (it != users_.end())
       return it->second;
@@ -381,8 +608,13 @@ public:
     return users_
         .emplace(id, pw ? std::string(pw->pw_name) : std::to_string(id))
         .first->second;
+#endif
   }
-  const std::string &group(std::uint32_t id) {
+  const std::string &group(std::uint32_t id, const std::string &winGroup = "") {
+    (void)id;
+#ifdef _WIN32
+    return winGroup.empty() ? fallback_ : winGroup;
+#else
     auto it = groups_.find(id);
     if (it != groups_.end())
       return it->second;
@@ -390,14 +622,20 @@ public:
     return groups_
         .emplace(id, gr ? std::string(gr->gr_name) : std::to_string(id))
         .first->second;
+#endif
   }
 
 private:
   std::unordered_map<std::uint32_t, std::string> users_{};
   std::unordered_map<std::uint32_t, std::string> groups_{};
+  std::string fallback_{"Unknown"};
 };
 
-// Logica per gestire i file .gitignore
+/**
+ * @struct GitIgnoreNode
+ * @brief Node tree adibito a calcolare l'ereditarietà di direttive ignore
+ * innestate in subfolder.
+ */
 struct GitIgnoreNode {
   std::vector<std::string> patterns;
   std::shared_ptr<GitIgnoreNode> parent;
@@ -460,19 +698,20 @@ struct GitIgnoreNode {
 
 /**
  * @class LSer
- * @brief Motore principale per la scansione del file system.
+ * @brief Motore principale per la scansione multithread del file system.
  */
 class LSer {
 public:
   /**
-   * @brief Costruisce il motore di scansione.
+   * @brief Costruisce il motore di scansione istanziando path target e flag
+   * base.
    * @param path Il percorso radice da analizzare.
    * @param flags Struttura con i parametri di configurazione.
    */
   explicit LSer(std::string_view path = ".", ListFlags flags = {})
       : flags_(flags), target_(path.empty() ? std::string_view{"."} : path) {}
 
-  // Fluent API per configurazione
+  // Fluent API per configurazione run-time (Chainable)
   LSer &with_hidden(bool v = true) & noexcept {
     flags_.show_hidden = v;
     return *this;
@@ -516,14 +755,21 @@ public:
   }
 
   /**
-   * @brief Esegue solo il caricamento in memoria (Uso per Benchmark).
+   * @brief Esegue esclusivamente il caricamento e lo smistamento dati in
+   * memoria senza renderli a IOStream. Ideale per fare Stress Testing con
+   * Google Benchmark.
    */
   void run_engine_only() { load_entries(); }
 
   /**
-   * @brief Esegue la scansione e stampa l'output sui flussi specificati.
-   * @return 0 in caso di successo, 1 se ci sono stati errori parziali, 2 per
-   * path invalido.
+   * @brief Esegue la scansione completa e stampa l'output bufferizzato sui
+   * flussi specificati.
+   * @param out File handler target su cui eseguire fwrite Standard-Out. (es.
+   * `stdout`)
+   * @param err File handler target su cui eseguire l'imissione diagnostica di
+   * warnings e tempo. (es. `stderr`)
+   * @return 0 in caso di successo totale, 1 se ci sono stati errori parziali
+   * (Permission denied), 2 per path root invalido.
    */
   int execute(std::FILE *out = stdout, std::FILE *err = stderr) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -559,10 +805,15 @@ public:
   directories() const noexcept {
     return directories_;
   }
+
   [[nodiscard]] const std::vector<std::string> &errors() const noexcept {
     return errors_;
   }
 
+  /**
+   * @brief Ritorna il count esatto di quanti file fisici e symlinks ha parsato
+   * l'engine nel filesystem.
+   */
   [[nodiscard]] std::size_t count() const noexcept {
     std::size_t total = 0;
     for (const auto &dir : directories_)
@@ -602,10 +853,15 @@ private:
   [[nodiscard]] bool recursive() const noexcept {
     return flags_.recursive || flags_.tree_view;
   }
+
   [[nodiscard]] bool need_details() const noexcept {
     return flags_.long_format || flags_.sort_by != SortBy::Name;
   }
 
+  /**
+   * @brief Scanner atomico eseguito dai Worker su Singolo ramo per non bloccare
+   * il mutex genitore. Utilizza API POSIX o Win32 a seconda del build System.
+   */
   void scan_directory(Task task, std::vector<Task> &subdirs,
                       std::vector<DirectoryResult> &sink,
                       detail::ErrorSink &errors) const {
@@ -618,6 +874,65 @@ private:
       }
     }
 
+#ifdef _WIN32
+    // ---- IMPLEMENTAZIONE WIN32 (FindFirstFile API) ----
+    std::string search_path = join_path(task.path, "*");
+    std::wstring wsearch = utf8_to_utf16(search_path);
+
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(wsearch.c_str(), &fd);
+
+    if (hFind == INVALID_HANDLE_VALUE) {
+      errors.add(
+          std::format("lser: impossibile aprire la cartella '{}'", task.path));
+      return;
+    }
+
+    // const bool details = need_details();
+    // const bool want_links = flags_.long_format || flags_.tree_view;
+    const bool can_descend = recursive() && (flags_.max_depth < 0 ||
+                                             task.depth + 1 < flags_.max_depth);
+
+    DirectoryResult res;
+    res.path = std::move(task.path);
+    res.entries.reserve(16);
+
+    do {
+      std::string nm = utf16_to_utf8(fd.cFileName);
+
+      if (nm == "." || nm == "..")
+        continue;
+      if (!flags_.show_hidden && nm[0] == '.')
+        continue;
+
+      FileEntry e;
+      bool is_dir_fast = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+
+      if (flags_.git_ignore && task.git_node) {
+        if (task.git_node->matches(nm, is_dir_fast))
+          continue;
+      }
+
+      if (flags_.dirs_only && !is_dir_fast)
+        continue;
+
+      e.name = nm;
+
+      // La Win32 struct ci regala già quasi tutti i metadata dello Stat
+      fill_from_find_data(e, fd);
+
+      if (can_descend && is_dir_fast) {
+        subdirs.push_back(
+            Task{join_path(res.path, e.name), task.depth + 1, task.git_node});
+      }
+
+      res.entries.push_back(std::move(e));
+    } while (FindNextFileW(hFind, &fd) != 0);
+
+    FindClose(hFind);
+
+#else
+    // ---- IMPLEMENTAZIONE ORIGINALE POSIX ----
     DIR *raw = ::opendir(task.path.c_str());
     if (raw == nullptr) {
       errors.add(std::format("lser: impossibile aprire la cartella '{}': {}",
@@ -693,6 +1008,7 @@ private:
       errors.add(std::format("lser: errore leggendo '{}': {}", res.path,
                              std::strerror(errno)));
     }
+#endif // _WIN32
 
     std::sort(
         res.entries.begin(), res.entries.end(),
@@ -796,6 +1112,31 @@ private:
     root_failed_ = false;
     root_is_file_ = false;
 
+    // Stat / File Checks
+#ifdef _WIN32
+    std::wstring wtarget = detail::utf8_to_utf16(target_);
+    DWORD dwAttrib = GetFileAttributesW(wtarget.c_str());
+
+    if (dwAttrib == INVALID_FILE_ATTRIBUTES) {
+      errors_.push_back(
+          std::format("lser: impossibile accedere a '{}'", target_));
+      root_failed_ = true;
+      return;
+    }
+
+    if (!(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
+      FileEntry e;
+      e.name = target_;
+      e.size = 0; // Se occorre si prende tramite handle. (Benchmark ignora
+                  // questa casistica root-file)
+      DirectoryResult r;
+      r.path = target_;
+      r.entries.push_back(std::move(e));
+      directories_.push_back(std::move(r));
+      root_is_file_ = true;
+      return;
+    }
+#else
     struct stat st{};
     if (::stat(target_.c_str(), &st) != 0) {
       errors_.push_back(std::format("lser: impossibile accedere a '{}': {}",
@@ -815,6 +1156,7 @@ private:
       root_is_file_ = true;
       return;
     }
+#endif
 
     Task root{detail::normalize_root(target_), 0, nullptr};
     detail::ErrorSink sink;
@@ -899,17 +1241,31 @@ private:
       for (const auto &e : dir.entries) {
         w_nlink =
             std::max(w_nlink, static_cast<int>(std::to_string(e.nlink).size()));
+#ifdef _WIN32
+        w_user = std::max(
+            w_user, static_cast<int>(names.user(e.uid, e.win_user).size()));
+        w_group = std::max(
+            w_group, static_cast<int>(names.group(e.gid, e.win_group).size()));
+#else
         w_user = std::max(w_user, static_cast<int>(names.user(e.uid).size()));
         w_group =
             std::max(w_group, static_cast<int>(names.group(e.gid).size()));
+#endif
         w_size = std::max(w_size, static_cast<int>(size_string(e).size()));
       }
 
       for (const auto &e : dir.entries) {
+#ifdef _WIN32
+        out.print("{} {:>{}} {:<{}} {:<{}} {:>{}} {} ", format_mode(e.mode),
+                  e.nlink, w_nlink, names.user(e.uid, e.win_user), w_user,
+                  names.group(e.gid, e.win_group), w_group, size_string(e),
+                  w_size, format_time(e.mtime_sec, now));
+#else
         out.print("{} {:>{}} {:<{}} {:<{}} {:>{}} {} ", format_mode(e.mode),
                   e.nlink, w_nlink, names.user(e.uid), w_user,
                   names.group(e.gid), w_group, size_string(e), w_size,
                   format_time(e.mtime_sec, now));
+#endif
         put_name(out, dir, e);
         out.put("\n");
       }
